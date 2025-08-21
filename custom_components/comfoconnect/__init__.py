@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -47,6 +48,8 @@ _LOGGER = logging.getLogger(__name__)
 SIGNAL_COMFOCONNECT_UPDATE_RECEIVED = "comfoconnect_update_{}_{}"
 
 KEEP_ALIVE_INTERVAL = timedelta(seconds=30)
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_BACKOFF_BASE = 2  # seconds
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -137,24 +140,63 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Add reconnection tracking
+    reconnect_attempts = 0
+    reconnect_lock = asyncio.Lock()
+    last_reconnect_time = 0
+
     @callback
     async def send_keepalive(now) -> None:
         """Send keepalive to the bridge."""
+        nonlocal reconnect_attempts, last_reconnect_time
+
+        # Check if we're already trying to reconnect
+        if reconnect_lock.locked():
+            _LOGGER.debug("Reconnection already in progress, skipping keepalive")
+            return
+
         _LOGGER.debug("Sending keepalive...")
         try:
             # Use cmd_time_request as a keepalive since cmd_keepalive doesn't send back a reply we can wait for
             await bridge.cmd_time_request()
 
+            # Reset reconnection attempts on successful communication
+            reconnect_attempts = 0
+
             # TODO: Mark sensors as available
 
-        except (AioComfoConnectNotConnected, AioComfoConnectTimeout):
-            # Reconnect when connection has been dropped
-            try:
-                await bridge.connect(entry.data[CONF_LOCAL_UUID])
-            except AioComfoConnectTimeout:
-                _LOGGER.debug("Connection timed out. Retrying later...")
+        except (AioComfoConnectNotConnected, AioComfoConnectTimeout) as exc:
+            _LOGGER.debug("Keepalive failed: %s", exc)
 
-                # TODO: Mark all sensors as unavailable
+            # Use lock to prevent concurrent reconnection attempts
+            async with reconnect_lock:
+                # Check if we've exceeded max attempts
+                if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                    _LOGGER.error("Max reconnection attempts reached (%d), giving up", MAX_RECONNECT_ATTEMPTS)
+                    # TODO: Mark all sensors as unavailable
+                    return
+
+                # Implement exponential backoff
+                backoff_time = RECONNECT_BACKOFF_BASE ** reconnect_attempts
+                current_time = now.timestamp()
+                if current_time - last_reconnect_time < backoff_time:
+                    _LOGGER.debug("Backoff period not elapsed, skipping reconnection attempt")
+                    return
+
+                reconnect_attempts += 1
+                last_reconnect_time = current_time
+
+                _LOGGER.info("Reconnection attempt %d/%d", reconnect_attempts, MAX_RECONNECT_ATTEMPTS)
+
+                try:
+                    await bridge.connect(entry.data[CONF_LOCAL_UUID])
+                    _LOGGER.info("Reconnection successful")
+                    reconnect_attempts = 0  # Reset on success
+                except AioComfoConnectTimeout:
+                    _LOGGER.warning("Reconnection attempt %d failed with timeout", reconnect_attempts)
+                    # TODO: Mark all sensors as unavailable
+                except Exception as reconnect_exc:
+                    _LOGGER.error("Reconnection attempt %d failed: %s", reconnect_attempts, reconnect_exc)
 
     entry.async_on_unload(async_track_time_interval(hass, send_keepalive, KEEP_ALIVE_INTERVAL))
 
@@ -191,6 +233,17 @@ class ComfoConnectBridge(ComfoConnect):
             self.alarm_callback,
         )
         self.hass = hass
+        self._connection_lock = asyncio.Lock()
+
+    async def connect(self, local_uuid: str):
+        """Connect to the bridge with concurrency protection."""
+        async with self._connection_lock:
+            return await super().connect(local_uuid)
+
+    async def disconnect(self):
+        """Disconnect from the bridge with concurrency protection."""
+        async with self._connection_lock:
+            return await super().disconnect()
 
     @callback
     def sensor_callback(self, sensor: Sensor, value):
